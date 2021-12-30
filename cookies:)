@@ -1,0 +1,205 @@
+table solution_waitingroom_config {
+  "enabled": "true", # Whether the waiting room is active
+  "allow_period_timeout": "3600", # Duration (sec) to grant access for before timing out
+  "wait_period_duration": "30", # Duration (sec) client waits before being eligible for retry
+  "allow_percentage": "50", # Percentage of eligible tokens to grant access
+  "cookie_lifetime": "7200", # Duration (sec) for cookie lifetime
+  "active_key": "key1", # Signing key to use to secure the tokens
+  "logger_name": "my-logger" # Log endpoint configured on your service to which to send log data
+}
+  # When you publish this solution to production, you'll want to use a private edge dictionary for this one.
+table solution_waitingroom_signingkeys {
+  "key1": "secret",
+  "key2": "another secret"
+}
+
+
+table solution_waitingroom_pages {
+
+  # "Sorry, you have to wait"
+  "startwaiting": "U29ycnksIHlvdSBoYXZlIHRvIHdhaXQu",
+
+  # "Please continue to wait"
+  "keepwaiting": "UGxlYXNlIGNvbnRpbnVlIHRvIHdhaXQ=",
+
+  # "Sorry, we're closed right now. Please try again later."
+  "deny": "U29ycnksIHdlJ3JlIGNsb3NlZCByaWdodCBub3cuICBQbGVhc2UgdHJ5IGFnYWluIGxhdGVyLg=="
+}
+ # The waiting room requires a fair few local variables, so define those first. The majority of the work in this solution will be in the vcl_recv subroutine so start by placing these declarations there:
+declare local var.cookie_decoded STRING;
+declare local var.expires INTEGER;
+declare local var.decision STRING;
+declare local var.percentage INTEGER;
+declare local var.string_to_sign STRING;
+declare local var.sig STRING;
+declare local var.user_id STRING;
+declare local var.authed_user_id STRING;
+declare local var.key_id STRING;
+declare local var.seed INTEGER;
+declare local var.duration_key STRING;
+declare local var.duration INTEGER;
+declare local var.logger_prefix STRING;
+
+if (req.restarts == 0) {
+  unset req.http.waitingroom_new_cookie;
+}
+
+
+# Only enable the waiting room...
+
+if (
+ fastly.ff.visits_this_service == 0 && # on edge nodes (not shield)
+ req.restarts == 0 && # on first VCL flow
+ table.lookup(solution_waitingroom_config, "enabled") == "true" && # if configured to run
+ req.url ~ "^/(events|checkout)" # and only for /events* and /checkout*
+) {
+
+  # Remainder of this tutorial's RECV code goes here
+
+}
+
+# set up a logger~catchall
+
+set var.logger_prefix = "syslog " +
+  req.service_id + " " +
+  table.lookup(solution_waitingroom_config, "logger_name") +
+  " :: [WAITINGROOM] "
+  ;
+  # identify the user
+  set var.authed_user_id = if (req.http.auth-user-id, req.http.auth-user-id, client.ip);
+  
+  # determine traffic <>
+  
+  set var.percentage = std.atoi(table.lookup(solution_waitingroom_config, "allow_percentage", "100"));
+
+if (var.percentage == 0 && table.lookup(solution_waitingroom_config, "allow_percentage") != "0") {
+  set var.percentage = 100;
+}
+
+# deal with decisions that do not require ai tokens
+
+if (var.percentage >= 100) {
+  set var.decision = "allow";
+
+# Special case for if user does not have a cookie
+} else if (!req.http.Cookie:waiting_room}}) {
+  set var.decision = "anon";
+
+  # Validate the cookie
+
+} else {
+
+  # ... Continue adding code from the next step here
+
+}
+
+# extraction from cookie
+set var.cookie_decoded = digest.base64_decode(req.http.Cookie:waiting_room);
+set var.expires = std.atoi(subfield(var.cookie_decoded, "exp", "&"));
+set var.sig = subfield(var.cookie_decoded, "sig", "&");
+set var.key_id = subfield(var.cookie_decoded, "kid", "&");
+set var.user_id = subfield(var.cookie_decoded, "uid", "&");
+set var.decision = subfield(var.cookie_decoded,"dec","&");
+
+# cookie validation
+if (var.user_id != var.authed_user_id) {
+  set var.decision = "anon";
+
+  log var.logger_prefix + "User " + var.authed_user_id + " denied while using a token generated for user " + var.user_id;
+
+} else if (!table.lookup(solution_waitingroom_signingkeys, var.key_id)) {
+  set var.decision = "anon";
+  log var.logger_prefix + "Unable to check signature due to missing key " + var.key_id;
+
+} else {
+  set var.string_to_sign = "dec=" + var.decision + "&exp=" + var.expires + "&uid=" + var.user_id + "&kid=" + var.key_id;
+
+  # If cookie signature doesn't check out, treat as anon
+  if (!digest.secure_is_equal(var.sig, digest.hmac_sha256(table.lookup(solution_waitingroom_signingkeys, var.key_id), var.string_to_sign))) {
+    set var.decision = "anon";
+    log var.logger_prefix + "Invalid signature";
+  }
+}
+
+# expired tokens
+if (time.is_after(now, std.integer2time(var.expires))) {
+
+  # If the user has been allowed, revert to anon
+
+  if (var.decision == "allow") {
+    log var.logger_prefix + "Expired allow token reverted to anon";
+    set var.decision = "anon";
+
+    # If the user is waiting, they've now waited their turn
+    # so reveal the cookie decision
+
+  } else if (var.decision == "wait") {
+    set var.seed = std.strtol(substr(var.sig,0,8),16);
+    set var.decision = if (randombool_seeded(var.percentage, 100, var.seed), "allow", "re-wait");
+  }
+}
+
+# creating a cookie 
+log var.logger_prefix + "Waiting room state: " + var.decision;
+
+if (var.decision == "anon" || var.decision == "allow" || var.decision == "re-wait") {
+  set var.duration_key = if (var.decision == "allow", "allow_period_timeout", "wait_period_duration");
+  set var.duration = std.atoi(table.lookup(solution_waitingroom_config, var.duration_key, "30"));
+
+  set var.expires = now;
+
+  if (var.decision == "allow") {
+    set var.expires += var.duration;
+  } else {
+
+    # For waiting users, set the expiry time to the next boundary
+
+    set var.expires /= var.duration;
+    set var.expires *= var.duration;
+    set var.expires += var.duration;
+    set var.expires += var.duration;
+  }
+
+  set var.key_id = table.lookup(solution_waitingroom_config, "active_key", "key1");
+  set var.string_to_sign = "dec=" + if (var.decision == "allow", "allow", "wait") + "&exp=" + var.expires + "&uid=" + var.authed_user_id + "&kid=" + var.key_id;
+  set var.sig = digest.hmac_sha256(table.lookup(solution_waitingroom_signingkeys, var.key_id), var.string_to_sign);
+  set req.http.waitingroom_new_cookie = "{{cookieName}}=" + digest.base64(var.string_to_sign + "&sig=" + var.sig) + "; path=/; max-age=" + table.lookup({{configTableName}}, "cookie_lifetime", "7200");
+} else if (var.decision == "deny") {
+  set req.http.waitingroom_new_cookie = "waiting_room=deleted; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+}
+
+# Reroute non-allowed users to canned responses
+
+if (var.decision == "anon") {
+  error 718 "waitingroom:startwaiting";
+} else if (var.decision == "wait" || var.decision == "re-wait") {
+  error 718 "waitingroom:keepwaiting";
+} else if (var.decision == "deny") {
+  error 718 "waitingroom:deny";
+}
+
+if (obj.status == 718 && obj.response ~ "^waitingroom:(\w+)$") {
+  set obj.status = 200;
+  set obj.response = "OK";
+  set obj.http.Cache-Control = "no-store, private";
+  if (re.group.1 ~ "^((start|keep)waiting)$") {
+    set obj.http.Refresh = "30; url=" req.url;
+  }
+  synthetic.base64 table.lookup(solution_waitingroom_pages, re.group.1, "");
+  return(deliver);
+}
+
+declare local var.page STRING;
+set var.page = table.lookup(solution_waitingroom_pages, re.group.1, "");
+if (var.page ~ "^/") {
+  set req.url = var.page;
+  restart;
+}
+# Set the cookie on the response
+if (req.http.waitingroom_new_cookie) {
+  add resp.http.set-cookie = req.http.waitingroom_new_cookie;
+  set resp.http.Cache-Control = "no-store, private";
+}
+# request to origin(s)
+unset bereq.http.cookie:waiting_room;
+unset bereq.http.waitingroom_new_cookie;
